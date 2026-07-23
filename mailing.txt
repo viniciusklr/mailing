@@ -1,0 +1,551 @@
+const GLOBAL = {
+  userId: "15971",
+  baseUrl: "http://172.16.10.4",
+  checkEveryMs: 10_000,
+  storageKey: "olos-schedule",
+};
+
+const HEADERS = {
+  "Content-Type": "application/json; charset=UTF-8",
+  Accept: "application/json, text/javascript, */*; q=0.01",
+  "X-Requested-With": "XMLHttpRequest",
+};
+
+const state = {
+  campaigns: [],
+  lastActivateDay: {},
+  lastDeactivateDay: {},
+  running: false,
+  lastTick: null,
+};
+
+function loadCampaigns() {
+  try {
+    const raw = localStorage.getItem(GLOBAL.storageKey);
+    state.campaigns = raw ? JSON.parse(raw) : [];
+    if (!Array.isArray(state.campaigns)) state.campaigns = [];
+  } catch (e) {
+    console.error("[schedule] Erro ao ler localStorage:", e);
+    state.campaigns = [];
+  }
+  return state.campaigns;
+}
+
+function saveCampaigns() {
+  localStorage.setItem(GLOBAL.storageKey, JSON.stringify(state.campaigns));
+}
+
+function findCampaign(id) {
+  const cid = String(id).replace(/\D/g, "");
+  return state.campaigns.find((c) => String(c.campaignId) === cid) || null;
+}
+
+function todayKey() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+function nowHHmm() {
+  const d = new Date();
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
+function isSkip(v) {
+  return v === 0 || v === "0";
+}
+
+function parseTime(v) {
+  if (v == null || v === "") return null;
+  if (isSkip(v)) return null;
+  if (typeof v === "number") {
+    const s = String(Math.trunc(v)).padStart(4, "0");
+    return `${s.slice(0, 2)}:${s.slice(2)}`;
+  }
+  const str = String(v).trim();
+  if (/^\d{1,2}:\d{2}$/.test(str)) {
+    const [h, m] = str.split(":");
+    return `${h.padStart(2, "0")}:${m}`;
+  }
+  if (/^\d{3,4}$/.test(str)) {
+    const s = str.padStart(4, "0");
+    return `${s.slice(0, 2)}:${s.slice(2)}`;
+  }
+  return str;
+}
+
+function parseAspNet(json) {
+  if (json == null) return json;
+  if (typeof json.d === "string") {
+    try {
+      return JSON.parse(json.d);
+    } catch {
+      return json.d;
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(json, "d")) return json.d;
+  return json;
+}
+
+async function apiPost(path, body) {
+  const response = await fetch(`${GLOBAL.baseUrl}${path}`, {
+    method: "POST",
+    credentials: "include",
+    headers: HEADERS,
+    body: JSON.stringify(body),
+  });
+  const text = await response.text();
+  let data;
+  try {
+    data = parseAspNet(JSON.parse(text));
+  } catch {
+    data = text;
+  }
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status} ${path}: ${String(text).slice(0, 400)}`);
+  }
+  return data;
+}
+
+function getMailingName(item) {
+  return item?._TableName || item?.pdmInfo?.TableName || item?.asmInfo?.Name || null;
+}
+
+function getMailingStatus(item) {
+  return String(item?._Status ?? "");
+}
+
+function isWorking(item) {
+  return /working/i.test(getMailingStatus(item));
+}
+
+function asMailingList(data) {
+  if (Array.isArray(data)) return data;
+  if (Array.isArray(data?.Mailings)) return data.Mailings;
+  if (Array.isArray(data?.mailings)) return data.mailings;
+  if (Array.isArray(data?.Items)) return data.Items;
+  console.warn("[schedule] ListMailings formato inesperado:", data);
+  return [];
+}
+
+function normalizeCamp(id, partial = {}) {
+  const required = ["activateAt", "deactivateAt", "maxChannels", "strategyId"];
+  for (const key of required) {
+    if (partial[key] === undefined || partial[key] === null || partial[key] === "") {
+      return null;
+    }
+  }
+
+  const activateAt = isSkip(partial.activateAt) ? null : parseTime(partial.activateAt);
+  const deactivateAt = isSkip(partial.deactivateAt) ? null : parseTime(partial.deactivateAt);
+
+  if (!isSkip(partial.activateAt) && !activateAt) return null;
+  if (!isSkip(partial.deactivateAt) && !deactivateAt) return null;
+
+  return {
+    campaignId: String(id).replace(/\D/g, ""),
+    activateAt,
+    deactivateAt,
+    maxChannels: isSkip(partial.maxChannels) ? 0 : Number(partial.maxChannels),
+    strategyId: isSkip(partial.strategyId) ? 0 : Number(partial.strategyId),
+  };
+}
+
+function printCamp(c) {
+  const at = c.activateAt || "-";
+  const dt = c.deactivateAt || "-";
+  const ch = Number(c.maxChannels) === 0 ? "canais(-)" : `canais ${c.maxChannels}`;
+  const st = Number(c.strategyId) === 0 ? "filtro(-)" : `filtro ${c.strategyId}`;
+  return `#${c.campaignId} | ${at}→${dt} | ${ch} | ${st}`;
+}
+
+function expandArgs(idOrLine, a, b, c, d) {
+  if (typeof idOrLine === "string" && idOrLine.includes(",")) {
+    const parts = idOrLine.split(",").map((x) => x.trim());
+    return {
+      id: parts[0],
+      activateAt: parts[1],
+      deactivateAt: parts[2],
+      maxChannels: parts[3],
+      strategyId: parts[4],
+    };
+  }
+
+  if (typeof a === "string" && a.includes(",") && b == null) {
+    const parts = a.split(",").map((x) => x.trim());
+    return {
+      id: idOrLine,
+      activateAt: parts[0],
+      deactivateAt: parts[1],
+      maxChannels: parts[2],
+      strategyId: parts[3],
+    };
+  }
+
+  return {
+    id: idOrLine,
+    activateAt: a,
+    deactivateAt: b,
+    maxChannels: c,
+    strategyId: d,
+  };
+}
+
+async function listMailings(camp) {
+  const data = await apiPost("/WebMonitor/Default.aspx/ListMailings", {
+    campaignId: Number(camp.campaignId),
+    filter: 0,
+    ordering: 1,
+    enableMailing: true,
+  });
+  return asMailingList(data);
+}
+
+async function setChannels(camp, maxChannels) {
+  return apiPost("/SysConfiguration/ChannelControl.aspx/UpdateMaxChannelCampaigns", {
+    campaingId: String(camp.campaignId),
+    maxChannels: String(maxChannels),
+  });
+}
+
+async function applyStrategy(camp, mailing) {
+  const data = {
+    CampaignId: String(camp.campaignId),
+    Mailing: mailing,
+    Modifiers: 0,
+    UseStrategyPlan: false,
+    StrategyId: Number(camp.strategyId),
+    StrategyName: "",
+    UserId: String(GLOBAL.userId),
+    Username: "",
+    RevokeStrategies: false,
+  };
+  console.log("[schedule] ApplyStrategy →", data);
+  const response = await fetch(`${GLOBAL.baseUrl}/WebMonitor/Default.aspx/ApplyStrategy`, {
+    method: "POST",
+    credentials: "include",
+    headers: HEADERS,
+    body: JSON.stringify({ data }),
+  });
+  const text = await response.text();
+  console.log("[schedule] ApplyStrategy ←", response.status, text.slice(0, 300));
+  try {
+    return parseAspNet(JSON.parse(text));
+  } catch {
+    return text;
+  }
+}
+
+async function changeMailingStatus(camp, mailing, activate) {
+  return apiPost("/WebMonitor/Default.aspx/ChangeMailingStatus", {
+    data: {
+      Mailing: mailing,
+      CampaignId: String(camp.campaignId),
+      Activate: activate,
+      UserId: String(GLOBAL.userId),
+      Username: "",
+    },
+  });
+}
+
+async function ativarCampanha(camp) {
+  console.log(`[schedule] >>> ATIVAR ${printCamp(camp)}`);
+  const mailings = await listMailings(camp);
+  console.log(`[schedule] mailings: ${mailings.length}`);
+  if (!mailings.length) throw new Error("Nenhum mailing na lista");
+
+  const mailingName = getMailingName(mailings[0]);
+  if (!mailingName) throw new Error("Não leu _TableName do 1º mailing");
+
+  const hasStrategy = Number(camp.strategyId) > 0;
+  const hasChannels = Number(camp.maxChannels) > 0;
+
+  if (hasStrategy) {
+    console.log(`[schedule] filtro StrategyId=${camp.strategyId} (Paused)`);
+    await applyStrategy(camp, mailingName);
+  } else {
+    console.log("[schedule] filtro pulado (strategyId=0)");
+  }
+
+  console.log("[schedule] ativando mailing", mailingName);
+  console.log(await changeMailingStatus(camp, mailingName, true));
+
+  if (hasStrategy) {
+    await new Promise((r) => setTimeout(r, 800));
+    console.log(`[schedule] reaplicando filtro StrategyId=${camp.strategyId}`);
+    await applyStrategy(camp, mailingName);
+  }
+
+  if (hasChannels) {
+    console.log(`[schedule] canais → ${camp.maxChannels}`);
+    console.log(await setChannels(camp, camp.maxChannels));
+  } else {
+    console.log("[schedule] canais pulados (maxChannels=0)");
+  }
+
+  console.log(`[schedule] <<< #${camp.campaignId} ATIVADA (${mailingName})`);
+}
+
+async function desativarCampanha(camp) {
+  console.log(`[schedule] >>> DESATIVAR ${printCamp(camp)}`);
+  console.log(await setChannels(camp, 0));
+
+  const mailings = await listMailings(camp);
+  const working = mailings.filter(isWorking);
+  console.log("[schedule] Working:", working.map(getMailingName));
+
+  for (const item of working) {
+    const name = getMailingName(item);
+    if (!name) continue;
+    console.log("[schedule] pausando", name);
+    console.log(await changeMailingStatus(camp, name, false));
+  }
+  console.log(`[schedule] <<< #${camp.campaignId} DESATIVADA`);
+}
+
+function lista() {
+  loadCampaigns();
+  console.log(`\n[schedule] ${state.campaigns.length} campanha(s) | agora ${nowHHmm()}`);
+  if (!state.campaigns.length) {
+    console.log('  vazia — add(ID, "09:10", "18:00", 20, 0)');
+  } else {
+    console.table(
+      state.campaigns.map((c) => ({
+        id: c.campaignId,
+        ativa: c.activateAt || "-",
+        desativa: c.deactivateAt || "-",
+        canais: Number(c.maxChannels) === 0 ? "-" : c.maxChannels,
+        strategyId: Number(c.strategyId) === 0 ? "-" : c.strategyId,
+      }))
+    );
+  }
+  return state.campaigns;
+}
+
+function add(idOrLine, a, b, c, d) {
+  loadCampaigns();
+  const raw = expandArgs(idOrLine, a, b, c, d);
+  const cid = String(raw.id ?? "").replace(/\D/g, "");
+  const uso = 'Uso: add(ID, "09:10", "18:00", 20, 0)  |  add(ID, 910, 1800, 20, 0)';
+
+  if (!cid) {
+    console.error(uso);
+    return null;
+  }
+  if (
+    raw.activateAt === undefined ||
+    raw.deactivateAt === undefined ||
+    raw.maxChannels === undefined ||
+    raw.strategyId === undefined
+  ) {
+    console.error(uso);
+    return null;
+  }
+  if (findCampaign(cid)) {
+    console.warn(`#${cid} já existe → edit(${cid}, ...) ou del(${cid})`);
+    campanha(cid);
+    return findCampaign(cid);
+  }
+
+  const camp = normalizeCamp(cid, {
+    activateAt: raw.activateAt,
+    deactivateAt: raw.deactivateAt,
+    maxChannels: raw.maxChannels,
+    strategyId: raw.strategyId,
+  });
+  if (!camp) {
+    console.error("Valores inválidos.", uso);
+    return null;
+  }
+
+  state.campaigns.push(camp);
+  saveCampaigns();
+  console.log("ADICIONADA:", printCamp(camp));
+  lista();
+  return camp;
+}
+
+function edit(idOrLine, a, b, c, d) {
+  loadCampaigns();
+  const raw = expandArgs(idOrLine, a, b, c, d);
+  const cid = String(raw.id ?? "").replace(/\D/g, "");
+  const camp = findCampaign(cid);
+  if (!camp) {
+    console.warn(`#${cid} não existe → add(ID, ativa, desativa, canais, strategyId)`);
+    return null;
+  }
+
+  const semArgs = a == null && b == null && c == null && d == null && typeof idOrLine !== "string";
+  const soIdString = typeof idOrLine === "string" && !idOrLine.includes(",") && a == null;
+
+  if (semArgs || soIdString) {
+    console.log(`\nEDITAR #${cid} — atual: ${printCamp(camp)}`);
+    console.log(`edit(${cid}, "09:30", "18:00", 40, 277)`);
+    console.log(`edit(${cid}, 930, 0, 40, 0)`);
+    return camp;
+  }
+
+  if (raw.activateAt != null) {
+    camp.activateAt = isSkip(raw.activateAt) ? null : parseTime(raw.activateAt);
+  }
+  if (raw.deactivateAt != null) {
+    camp.deactivateAt = isSkip(raw.deactivateAt) ? null : parseTime(raw.deactivateAt);
+  }
+
+  if (raw.maxChannels != null) {
+    camp.maxChannels = isSkip(raw.maxChannels) ? 0 : Number(raw.maxChannels);
+  }
+  if (raw.strategyId != null) {
+    camp.strategyId = isSkip(raw.strategyId) ? 0 : Number(raw.strategyId);
+  }
+
+  saveCampaigns();
+  console.log("EDITADA:", printCamp(camp));
+  lista();
+  return camp;
+}
+
+function del(id) {
+  loadCampaigns();
+  const cid = String(id ?? "").replace(/\D/g, "");
+  if (!cid) {
+    console.error("Uso: del(ID)");
+    return false;
+  }
+  if (!findCampaign(cid)) {
+    console.warn(`#${cid} não está na lista`);
+    return false;
+  }
+  state.campaigns = state.campaigns.filter((c) => String(c.campaignId) !== cid);
+  saveCampaigns();
+  delete state.lastActivateDay[cid];
+  delete state.lastDeactivateDay[cid];
+  console.log(`EXCLUÍDA #${cid}`);
+  lista();
+  return true;
+}
+
+function campanha(id) {
+  loadCampaigns();
+  const cid = String(id ?? "").replace(/\D/g, "");
+  if (!cid) {
+    console.log("Ex: campanha(ID)");
+    return;
+  }
+
+  const c = findCampaign(cid);
+  console.log(`\n════════ Campanha ${cid} ════════`);
+
+  if (!c) {
+    console.log("NÃO está na lista.\n");
+    console.log(`add(${cid}, "09:10", "18:00", 20, 0)`);
+    console.log(`add(${cid}, 910, 1800, 20, 277)`);
+    return;
+  }
+
+  console.log("JÁ configurada:", printCamp(c));
+  console.log(`edit(${cid}, "09:30", "18:00", 40, 277)`);
+  console.log(`del(${cid})`);
+}
+
+function status() {
+  loadCampaigns();
+  const hora = nowHHmm();
+  const dia = todayKey();
+  console.log(`[schedule] agora=${hora} dia=${dia} monitor=${!!window.__scheduleInterval}`);
+  console.table(
+    state.campaigns.map((c) => ({
+      id: c.campaignId,
+      ativa: c.activateAt || "-",
+      desativa: c.deactivateAt || "-",
+      bateAtivar: !!(c.activateAt && hora === c.activateAt),
+      bateDesativar: !!(c.deactivateAt && hora === c.deactivateAt),
+      jaAtivouHoje: state.lastActivateDay[c.campaignId] === dia,
+      jaDesativouHoje: state.lastDeactivateDay[c.campaignId] === dia,
+    }))
+  );
+}
+
+function ajuda() {
+  console.log(`
+COMANDOS:
+  add(ID, "09:10", "18:00", 20, 0)
+  add(ID, 910, 1800, 20, 0)
+  add("ID,09:10,18:00,20,0")
+  edit(ID, "09:30", 0, 40, 277)
+  del(ID)
+  lista() | status() | campanha(ID)
+
+Args: ID, ativa, desativa, canais, strategyId
+  informe os 5 no add (sem default)
+  0 = pular (horário sem agendar / canais ou filtro off)
+`);
+}
+
+async function tick() {
+  if (state.running) return;
+  state.running = true;
+  state.lastTick = new Date().toLocaleTimeString();
+
+  try {
+    loadCampaigns();
+    const hora = nowHHmm();
+    const dia = todayKey();
+
+    for (const camp of state.campaigns) {
+      const id = String(camp.campaignId);
+
+      if (camp.activateAt && hora === camp.activateAt && state.lastActivateDay[id] !== dia) {
+        console.log(`[schedule] horário ATIVAR bateu #${id} (${hora})`);
+        state.lastActivateDay[id] = dia;
+        try {
+          await ativarCampanha(camp);
+        } catch (err) {
+          console.error(`[schedule] falha ativar #${id}:`, err);
+          delete state.lastActivateDay[id];
+        }
+      }
+
+      if (camp.deactivateAt && hora === camp.deactivateAt && state.lastDeactivateDay[id] !== dia) {
+        console.log(`[schedule] horário DESATIVAR bateu #${id} (${hora})`);
+        state.lastDeactivateDay[id] = dia;
+        try {
+          await desativarCampanha(camp);
+        } catch (err) {
+          console.error(`[schedule] falha desativar #${id}:`, err);
+          delete state.lastDeactivateDay[id];
+        }
+      }
+    }
+  } finally {
+    state.running = false;
+  }
+}
+
+loadCampaigns();
+
+window.schedule = {
+  global: GLOBAL,
+  state,
+  add,
+  edit,
+  del,
+  lista,
+  campanha,
+  status,
+  ajuda,
+};
+
+window.add = add;
+window.edit = edit;
+window.del = del;
+window.lista = lista;
+window.campanha = campanha;
+window.status = status;
+window.ajuda = ajuda;
+
+ajuda();
+if (window.__scheduleInterval) clearInterval(window.__scheduleInterval);
+console.log(`[schedule] MONITOR ON | check ${GLOBAL.checkEveryMs}ms | agora ${nowHHmm()}`);
+lista();
+tick();
+window.__scheduleInterval = setInterval(tick, GLOBAL.checkEveryMs);
