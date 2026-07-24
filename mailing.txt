@@ -36,8 +36,25 @@ function saveCampaigns() {
 }
 
 function findCampaign(id) {
+  const list = findCampaigns(id);
+  return list[0] || null;
+}
+
+function findCampaigns(id) {
   const cid = String(id).replace(/\D/g, "");
-  return state.campaigns.find((c) => String(c.campaignId) === cid) || null;
+  return state.campaigns.filter((c) => String(c.campaignId) === cid);
+}
+
+function findSlot(id, activateAt) {
+  const time = parseTime(activateAt);
+  return (
+    findCampaigns(id).find((c) => c.activateAt === time) || null
+  );
+}
+
+function slotKey(camp, kind) {
+  const t = kind === "activate" ? camp.activateAt : camp.deactivateAt;
+  return `${camp.campaignId}@${t || "-"}@${kind}`;
 }
 
 function todayKey() {
@@ -304,12 +321,13 @@ async function desativarCampanha(camp) {
 
 function lista() {
   loadCampaigns();
-  console.log(`\n[schedule] ${state.campaigns.length} campanha(s) | agora ${nowHHmm()}`);
+  console.log(`\n[schedule] ${state.campaigns.length} periodo(s) | agora ${nowHHmm()}`);
   if (!state.campaigns.length) {
-    console.log('  vazia — add(ID, "09:10", "18:00", 20, 0)');
+    console.log('  vazia — add(ID, "09:10", "11:50", 60, 307)');
   } else {
     console.table(
-      state.campaigns.map((c) => ({
+      state.campaigns.map((c, i) => ({
+        n: i,
         id: c.campaignId,
         ativa: c.activateAt || "-",
         desativa: c.deactivateAt || "-",
@@ -325,7 +343,7 @@ function add(idOrLine, a, b, c, d) {
   loadCampaigns();
   const raw = expandArgs(idOrLine, a, b, c, d);
   const cid = String(raw.id ?? "").replace(/\D/g, "");
-  const uso = 'Uso: add(ID, "09:10", "18:00", 20, 0)  |  add(ID, 910, 1800, 20, 0)';
+  const uso = 'Uso: add(ID, "09:10", "11:50", 60, 307)  |  add(ID, 910, 1150, 60, 307)';
 
   if (!cid) {
     console.error(uso);
@@ -340,11 +358,6 @@ function add(idOrLine, a, b, c, d) {
     console.error(uso);
     return null;
   }
-  if (findCampaign(cid)) {
-    console.warn(`#${cid} já existe → edit(${cid}, ...) ou del(${cid})`);
-    campanha(cid);
-    return findCampaign(cid);
-  }
 
   const camp = normalizeCamp(cid, {
     activateAt: raw.activateAt,
@@ -355,6 +368,14 @@ function add(idOrLine, a, b, c, d) {
   if (!camp) {
     console.error("Valores inválidos.", uso);
     return null;
+  }
+
+  if (camp.activateAt && findSlot(cid, camp.activateAt)) {
+    console.warn(
+      `#${cid} já tem periodo iniciando ${camp.activateAt} → edit(${cid}, "${camp.activateAt}", ...) ou del(${cid}, "${camp.activateAt}")`
+    );
+    campanha(cid);
+    return findSlot(cid, camp.activateAt);
   }
 
   state.campaigns.push(camp);
@@ -368,8 +389,9 @@ function edit(idOrLine, a, b, c, d) {
   loadCampaigns();
   const raw = expandArgs(idOrLine, a, b, c, d);
   const cid = String(raw.id ?? "").replace(/\D/g, "");
-  const camp = findCampaign(cid);
-  if (!camp) {
+  const slots = findCampaigns(cid);
+
+  if (!slots.length) {
     console.warn(`#${cid} não existe → add(ID, ativa, desativa, canais, strategyId)`);
     return null;
   }
@@ -378,19 +400,44 @@ function edit(idOrLine, a, b, c, d) {
   const soIdString = typeof idOrLine === "string" && !idOrLine.includes(",") && a == null;
 
   if (semArgs || soIdString) {
-    console.log(`\nEDITAR #${cid} — atual: ${printCamp(camp)}`);
-    console.log(`edit(${cid}, "09:30", "18:00", 40, 277)`);
-    console.log(`edit(${cid}, 930, 0, 40, 0)`);
-    return camp;
+    console.log(`\nEDITAR #${cid} — ${slots.length} periodo(s):`);
+    slots.forEach((s) => console.log(" ", printCamp(s)));
+    if (slots.length > 1) {
+      console.log(`edit(${cid}, "09:10", "11:50", 60, 307)  // 1º horário identifica o periodo`);
+    } else {
+      console.log(`edit(${cid}, "09:30", "11:50", 60, 307)`);
+    }
+    return slots;
   }
 
-  if (raw.activateAt != null) {
-    camp.activateAt = isSkip(raw.activateAt) ? null : parseTime(raw.activateAt);
+  let camp = slots.length === 1 ? slots[0] : null;
+  if (!camp) {
+    const keyTime = parseTime(raw.activateAt);
+    camp = slots.find((s) => s.activateAt === keyTime) || null;
+    if (!camp) {
+      console.warn(`#${cid} tem ${slots.length} periodos. Informe a ativa atual:`);
+      slots.forEach((s) => console.log(`  edit(${cid}, "${s.activateAt}", "${s.deactivateAt}", ${s.maxChannels}, ${s.strategyId})`));
+      return null;
+    }
   }
+
+  if (raw.activateAt != null && slots.length === 1) {
+    camp.activateAt = isSkip(raw.activateAt) ? null : parseTime(raw.activateAt);
+  } else if (raw.activateAt != null && !isSkip(raw.activateAt) && slots.length > 1) {
+    const newAt = parseTime(raw.activateAt);
+    if (newAt && newAt !== camp.activateAt) {
+      const conflict = findSlot(cid, newAt);
+      if (conflict && conflict !== camp) {
+        console.warn(`Já existe periodo #${cid} em ${newAt}`);
+        return null;
+      }
+      camp.activateAt = newAt;
+    }
+  }
+
   if (raw.deactivateAt != null) {
     camp.deactivateAt = isSkip(raw.deactivateAt) ? null : parseTime(raw.deactivateAt);
   }
-
   if (raw.maxChannels != null) {
     camp.maxChannels = isSkip(raw.maxChannels) ? 0 : Number(raw.maxChannels);
   }
@@ -404,22 +451,45 @@ function edit(idOrLine, a, b, c, d) {
   return camp;
 }
 
-function del(id) {
+function del(id, activateAt) {
   loadCampaigns();
   const cid = String(id ?? "").replace(/\D/g, "");
   if (!cid) {
-    console.error("Uso: del(ID)");
+    console.error('Uso: del(ID)  |  del(ID, "09:10")');
     return false;
   }
-  if (!findCampaign(cid)) {
+
+  const slots = findCampaigns(cid);
+  if (!slots.length) {
     console.warn(`#${cid} não está na lista`);
     return false;
   }
+
+  if (activateAt != null && activateAt !== "*" && !isSkip(activateAt)) {
+    const time = parseTime(activateAt);
+    const before = state.campaigns.length;
+    state.campaigns = state.campaigns.filter(
+      (c) => !(String(c.campaignId) === cid && c.activateAt === time)
+    );
+    if (state.campaigns.length === before) {
+      console.warn(`#${cid} periodo ${time} não encontrado`);
+      campanha(cid);
+      return false;
+    }
+    saveCampaigns();
+    delete state.lastActivateDay[slotKey({ campaignId: cid, activateAt: time }, "activate")];
+    console.log(`EXCLUÍDA #${cid} periodo ${time}`);
+    lista();
+    return true;
+  }
+
   state.campaigns = state.campaigns.filter((c) => String(c.campaignId) !== cid);
   saveCampaigns();
-  delete state.lastActivateDay[cid];
-  delete state.lastDeactivateDay[cid];
-  console.log(`EXCLUÍDA #${cid}`);
+  for (const s of slots) {
+    delete state.lastActivateDay[slotKey(s, "activate")];
+    delete state.lastDeactivateDay[slotKey(s, "deactivate")];
+  }
+  console.log(`EXCLUÍDA #${cid} (${slots.length} periodo(s))`);
   lista();
   return true;
 }
@@ -432,18 +502,20 @@ function campanha(id) {
     return;
   }
 
-  const c = findCampaign(cid);
+  const slots = findCampaigns(cid);
   console.log(`\n════════ Campanha ${cid} ════════`);
 
-  if (!c) {
+  if (!slots.length) {
     console.log("NÃO está na lista.\n");
-    console.log(`add(${cid}, "09:10", "18:00", 20, 0)`);
-    console.log(`add(${cid}, 910, 1800, 20, 277)`);
+    console.log(`add(${cid}, "09:10", "11:50", 60, 307)`);
+    console.log(`add(${cid}, "14:30", "17:00", 60, 307)`);
     return;
   }
 
-  console.log("JÁ configurada:", printCamp(c));
-  console.log(`edit(${cid}, "09:30", "18:00", 40, 277)`);
+  console.log(`${slots.length} periodo(s):`);
+  slots.forEach((s) => console.log(" ", printCamp(s)));
+  console.log(`edit(${cid}, "${slots[0].activateAt}", "${slots[0].deactivateAt}", ${slots[0].maxChannels}, ${slots[0].strategyId})`);
+  console.log(`del(${cid}, "${slots[0].activateAt}")`);
   console.log(`del(${cid})`);
 }
 
@@ -459,8 +531,8 @@ function status() {
       desativa: c.deactivateAt || "-",
       bateAtivar: !!(c.activateAt && hora === c.activateAt),
       bateDesativar: !!(c.deactivateAt && hora === c.deactivateAt),
-      jaAtivouHoje: state.lastActivateDay[c.campaignId] === dia,
-      jaDesativouHoje: state.lastDeactivateDay[c.campaignId] === dia,
+      jaAtivouHoje: state.lastActivateDay[slotKey(c, "activate")] === dia,
+      jaDesativouHoje: state.lastDeactivateDay[slotKey(c, "deactivate")] === dia,
     }))
   );
 }
@@ -468,15 +540,15 @@ function status() {
 function ajuda() {
   console.log(`
 COMANDOS:
-  add(ID, "09:10", "18:00", 20, 0)
-  add(ID, 910, 1800, 20, 0)
-  add("ID,09:10,18:00,20,0")
-  edit(ID, "09:30", 0, 40, 277)
+  add(ID, "09:10", "11:50", 60, 307)
+  add(ID, "14:30", "17:00", 60, 307)
+  edit(ID, "09:10", "11:50", 60, 307)
   del(ID)
+  del(ID, "09:10")
   lista() | status() | campanha(ID)
 
 Args: ID, ativa, desativa, canais, strategyId
-  informe os 5 no add (sem default)
+  mesmo ID pode ter varios periodos (manha/tarde)
   0 = pular (horário sem agendar / canais ou filtro off)
 `);
 }
@@ -492,27 +564,28 @@ async function tick() {
     const dia = todayKey();
 
     for (const camp of state.campaigns) {
-      const id = String(camp.campaignId);
+      const ak = slotKey(camp, "activate");
+      const dk = slotKey(camp, "deactivate");
 
-      if (camp.activateAt && hora === camp.activateAt && state.lastActivateDay[id] !== dia) {
-        console.log(`[schedule] horário ATIVAR bateu #${id} (${hora})`);
-        state.lastActivateDay[id] = dia;
+      if (camp.activateAt && hora === camp.activateAt && state.lastActivateDay[ak] !== dia) {
+        console.log(`[schedule] horário ATIVAR bateu #${camp.campaignId} (${hora})`);
+        state.lastActivateDay[ak] = dia;
         try {
           await ativarCampanha(camp);
         } catch (err) {
-          console.error(`[schedule] falha ativar #${id}:`, err);
-          delete state.lastActivateDay[id];
+          console.error(`[schedule] falha ativar #${camp.campaignId}:`, err);
+          delete state.lastActivateDay[ak];
         }
       }
 
-      if (camp.deactivateAt && hora === camp.deactivateAt && state.lastDeactivateDay[id] !== dia) {
-        console.log(`[schedule] horário DESATIVAR bateu #${id} (${hora})`);
-        state.lastDeactivateDay[id] = dia;
+      if (camp.deactivateAt && hora === camp.deactivateAt && state.lastDeactivateDay[dk] !== dia) {
+        console.log(`[schedule] horário DESATIVAR bateu #${camp.campaignId} (${hora})`);
+        state.lastDeactivateDay[dk] = dia;
         try {
           await desativarCampanha(camp);
         } catch (err) {
-          console.error(`[schedule] falha desativar #${id}:`, err);
-          delete state.lastDeactivateDay[id];
+          console.error(`[schedule] falha desativar #${camp.campaignId}:`, err);
+          delete state.lastDeactivateDay[dk];
         }
       }
     }
